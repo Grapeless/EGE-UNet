@@ -1,0 +1,71 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# 虚拟环境
+venv/
+env/
+.venv/
+.env/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# 模型权重 & 检查点
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.pkl
+*.bin
+checkpoints/
+weights/
+pretrained/
+
+# 训练结果 & 日志
+results/
+logs/
+runs/
+wandb/
+tensorboard/
+*.log
+
+# 数据集
+data/isic2017/
+data/isic2018/
+*.csv
+*.json
+*.npy
+*.npz
+
+# 图片输出
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.bak
+tmp/
+temp/

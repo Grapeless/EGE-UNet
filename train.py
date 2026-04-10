@@ -72,11 +72,13 @@ def main(config):
     print('#----------Prepareing Model----------#')
     model_cfg = config.model_config
     if config.network == 'egeunet':
-        model = EGEUNet(num_classes=model_cfg['num_classes'], 
-                        input_channels=model_cfg['input_channels'], 
-                        c_list=model_cfg['c_list'], 
+        model = EGEUNet(num_classes=model_cfg['num_classes'],
+                        input_channels=model_cfg['input_channels'],
+                        c_list=model_cfg['c_list'],
                         bridge=model_cfg['bridge'],
                         gt_ds=model_cfg['gt_ds'],
+                        use_ca=model_cfg.get('use_ca', False),
+                        use_boundary=model_cfg.get('use_boundary', False),
                         )
     else: raise Exception('network in not right!')
     model = model.cuda()
@@ -89,6 +91,20 @@ def main(config):
     criterion = config.criterion
     optimizer = get_optimizer(config, model)
     scheduler = get_scheduler(config, optimizer)
+
+    # Wrap with warmup if configured
+    if getattr(config, 'use_warmup', False):
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=config.warmup_start_factor,
+            total_iters=config.warmup_epochs
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, scheduler],
+            milestones=[config.warmup_epochs]
+        )
+        print(f'#----------Warmup enabled: {config.warmup_epochs} epochs, start_factor={config.warmup_start_factor}----------#')
 
 
 
@@ -173,6 +189,16 @@ def main(config):
                 criterion,
                 logger,
                 config,
+            )
+        # TTA evaluation
+        print('#----------Testing with TTA----------#')
+        test_one_epoch(
+                val_loader,
+                model,
+                criterion,
+                logger,
+                config,
+                use_tta=True,
             )
         os.rename(
             os.path.join(checkpoint_dir, 'best.pth'),

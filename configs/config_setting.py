@@ -1,7 +1,9 @@
 from torchvision import transforms
 from utils import *
+from utils import GT_BceDiceLoss_WithBoundary
+from utils import myColorJitter, myRandomResizedCrop, myGaussianBlur
 
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 class setting_config:
     """
@@ -10,14 +12,16 @@ class setting_config:
 
     network = 'egeunet'
     model_config = {
-        'num_classes': 1, 
-        'input_channels': 3, 
-        'c_list': [8,16,24,32,48,64], 
+        'num_classes': 1,
+        'input_channels': 3,
+        'c_list': [8,16,24,32,48,64],
         'bridge': True,
         'gt_ds': True,
+        'use_ca': True,        # Coordinate Attention on encoder 1-3
+        'use_boundary': True,  # Boundary-Aware Supervision
     }
 
-    datasets = 'isic17' 
+    datasets = 'isic18' 
     if datasets == 'isic18':
         data_path = './data/isic2018/'
     elif datasets == 'isic17':
@@ -25,7 +29,11 @@ class setting_config:
     else:
         raise Exception('datasets in not right!')
 
-    criterion = GT_BceDiceLoss(wb=1, wd=1)
+    # Criterion: auto-select based on use_boundary flag
+    if model_config.get('use_boundary', False):
+        criterion = GT_BceDiceLoss_WithBoundary(wb=1, wd=1, boundary_weight=0.5)
+    else:
+        criterion = GT_BceDiceLoss(wb=1, wd=1)
 
     pretrained_path = './pre_trained/'
     num_classes = 1
@@ -34,16 +42,21 @@ class setting_config:
     input_channels = 3
     distributed = False
     local_rank = -1
-    num_workers = 0
+    num_workers = 18
     seed = 42
     world_size = None
     rank = None
-    amp = False
+    amp = True
     gpu_id = '0'
     batch_size = 8
     epochs = 300
 
-    work_dir = 'results/' + network + '_' + datasets + '_' + datetime.now().strftime('%A_%d_%B_%Y_%Hh_%Mm_%Ss') + '/'
+    # Warmup config
+    use_warmup = True
+    warmup_epochs = 10
+    warmup_start_factor = 0.01
+
+    work_dir = 'results/' + network + '_' + datasets + '_' + datetime.now(timezone(timedelta(hours=8))).strftime('%A_%d_%B_%Y_%Hh_%Mm_%Ss') + '/'
 
     print_interval = 20
     val_interval = 30
@@ -53,10 +66,12 @@ class setting_config:
     train_transformer = transforms.Compose([
         myNormalize(datasets, train=True),
         myToTensor(),
+        myColorJitter(p=0.5, brightness=0.2, contrast=0.2, saturation=0.1, hue=0.05),
         myRandomHorizontalFlip(p=0.5),
         myRandomVerticalFlip(p=0.5),
         myRandomRotation(p=0.5, degree=[0, 360]),
-        myResize(input_size_h, input_size_w)
+        myRandomResizedCrop(input_size_h, input_size_w, scale=(0.8, 1.0)),
+        myGaussianBlur(p=0.3, kernel_size=3, sigma=(0.1, 1.0)),
     ])
     test_transformer = transforms.Compose([
         myNormalize(datasets, train=False),
@@ -130,9 +145,9 @@ class setting_config:
         gamma = 0.99 #  – Multiplicative factor of learning rate decay.
         last_epoch = -1 # – The index of last epoch. Default: -1.
     elif sch == 'CosineAnnealingLR':
-        T_max = 50 # – Maximum number of iterations. Cosine function period.
+        T_max = 290 # – Cosine period = epochs - warmup_epochs (300-10=290)
         eta_min = 0.00001 # – Minimum learning rate. Default: 0.
-        last_epoch = -1 # – The index of last epoch. Default: -1.  
+        last_epoch = -1 # – The index of last epoch. Default: -1.
     elif sch == 'ReduceLROnPlateau':
         mode = 'min' # – One of min, max. In min mode, lr will be reduced when the quantity monitored has stopped decreasing; in max mode it will be reduced when the quantity monitored has stopped increasing. Default: ‘min’.
         factor = 0.1 # – Factor by which the learning rate will be reduced. new_lr = lr * factor. Default: 0.1.

@@ -46,7 +46,13 @@ def get_logger(name, log_dir):
                                                              encoding='utf-8')
     info_handler.setLevel(logging.INFO)
 
-    formatter = logging.Formatter('%(asctime)s - %(message)s',
+    class BeijingFormatter(logging.Formatter):
+        """Force timestamps to Beijing time (UTC+8)."""
+        import datetime as _dt, time as _time
+        _beijing_offset = _dt.timezone(_dt.timedelta(hours=8))
+        converter = lambda self, t: self._dt.datetime.fromtimestamp(t, self._beijing_offset).timetuple()
+
+    formatter = BeijingFormatter('%(asctime)s - %(message)s',
                                   datefmt='%Y-%m-%d %H:%M:%S')
 
     info_handler.setFormatter(formatter)
@@ -303,11 +309,50 @@ class GT_BceDiceLoss(nn.Module):
         super(GT_BceDiceLoss, self).__init__()
         self.bcedice = BceDiceLoss(wb, wd)
 
-    def forward(self, gt_pre, out, target):
+    def forward(self, gt_pre, out, target, boundary_logits=None):
         bcediceloss = self.bcedice(out, target)
         gt_pre5, gt_pre4, gt_pre3, gt_pre2, gt_pre1 = gt_pre
         gt_loss = self.bcedice(gt_pre5, target) * 0.1 + self.bcedice(gt_pre4, target) * 0.2 + self.bcedice(gt_pre3, target) * 0.3 + self.bcedice(gt_pre2, target) * 0.4 + self.bcedice(gt_pre1, target) * 0.5
         return bcediceloss + gt_loss
+
+
+class GT_BceDiceLoss_WithBoundary(nn.Module):
+    """GT_BceDiceLoss extended with multi-scale boundary-aware supervision."""
+
+    def __init__(self, wb=1, wd=1, boundary_weight=0.5):
+        super().__init__()
+        self.bcedice = BceDiceLoss(wb, wd)
+        self.boundary_weight = boundary_weight
+        from models.modules import BoundaryLoss, generate_boundary_gt
+        self.boundary_loss_fn = BoundaryLoss(bce_weight=0.5, dice_weight=0.5)
+        self.generate_boundary_gt = generate_boundary_gt
+
+    def forward(self, gt_pre, out, target, boundary_logits=None):
+        bcediceloss = self.bcedice(out, target)
+        gt_pre5, gt_pre4, gt_pre3, gt_pre2, gt_pre1 = gt_pre
+        gt_loss = (self.bcedice(gt_pre5, target) * 0.1
+                   + self.bcedice(gt_pre4, target) * 0.2
+                   + self.bcedice(gt_pre3, target) * 0.3
+                   + self.bcedice(gt_pre2, target) * 0.4
+                   + self.bcedice(gt_pre1, target) * 0.5)
+
+        total_loss = bcediceloss + gt_loss
+
+        if boundary_logits is not None:
+            boundary_gt = self.generate_boundary_gt(target, dilation_radius=3)
+            # boundary_logits is a tuple: (bd_coarse_H/8, bd_fine_H/2)
+            if isinstance(boundary_logits, tuple):
+                bd_coarse, bd_fine = boundary_logits
+                # Coarse boundary loss (H/8, weight 0.3)
+                b_loss_coarse = self.boundary_loss_fn(bd_coarse, boundary_gt)
+                # Fine boundary loss (H/2, weight 0.7)
+                b_loss_fine = self.boundary_loss_fn(bd_fine, boundary_gt)
+                b_loss = 0.3 * b_loss_coarse + 0.7 * b_loss_fine
+            else:
+                b_loss = self.boundary_loss_fn(boundary_logits, boundary_gt)
+            total_loss = total_loss + self.boundary_weight * b_loss
+
+        return total_loss
 
 
 
@@ -354,6 +399,91 @@ class myRandomRotation:
         image, mask = data
         if random.random() < self.p: return TF.rotate(image,self.angle), TF.rotate(mask,self.angle)
         else: return image, mask 
+
+
+class myColorJitter:
+    """Random color jitter on image only (tensor). Mask is unchanged."""
+    def __init__(self, p=0.5, brightness=0.2, contrast=0.2, saturation=0.1, hue=0.05):
+        self.p = p
+        self.jitter = torch.nn.Identity()  # placeholder
+        self.brightness = brightness
+        self.contrast = contrast
+        self.saturation = saturation
+        self.hue = hue
+
+    def __call__(self, data):
+        image, mask = data
+        if random.random() < self.p:
+            # image: (C, H, W) tensor, value range ~0-255
+            b = 1.0 + random.uniform(-self.brightness, self.brightness)
+            c = 1.0 + random.uniform(-self.contrast, self.contrast)
+            s = 1.0 + random.uniform(-self.saturation, self.saturation)
+            h = random.uniform(-self.hue, self.hue)
+            image = TF.adjust_brightness(image, b)
+            image = TF.adjust_contrast(image, c)
+            image = TF.adjust_saturation(image, s)
+            image = TF.adjust_hue(image, h)
+        return image, mask
+
+
+class myRandomResizedCrop:
+    """Random resized crop applied to both image and mask (tensor)."""
+    def __init__(self, size_h=256, size_w=256, scale=(0.8, 1.0), ratio=(0.9, 1.1)):
+        self.size_h = size_h
+        self.size_w = size_w
+        self.scale = scale
+        self.ratio = ratio
+
+    def __call__(self, data):
+        image, mask = data
+        # Get random crop parameters (same for image and mask)
+        i, j, h, w = self._get_params(image, self.scale, self.ratio)
+        image = TF.resized_crop(image, i, j, h, w, [self.size_h, self.size_w])
+        mask = TF.resized_crop(mask, i, j, h, w, [self.size_h, self.size_w])
+        return image, mask
+
+    @staticmethod
+    def _get_params(img, scale, ratio):
+        _, height, width = img.shape
+        area = height * width
+        for _ in range(10):
+            target_area = random.uniform(scale[0], scale[1]) * area
+            aspect_ratio = random.uniform(ratio[0], ratio[1])
+            w = int(round(math.sqrt(target_area * aspect_ratio)))
+            h = int(round(math.sqrt(target_area / aspect_ratio)))
+            if 0 < w <= width and 0 < h <= height:
+                i = random.randint(0, height - h)
+                j = random.randint(0, width - w)
+                return i, j, h, w
+        # Fallback: center crop
+        in_ratio = float(width) / float(height)
+        if in_ratio < min(ratio):
+            w = width
+            h = int(round(w / min(ratio)))
+        elif in_ratio > max(ratio):
+            h = height
+            w = int(round(h * max(ratio)))
+        else:
+            w = width
+            h = height
+        i = (height - h) // 2
+        j = (width - w) // 2
+        return i, j, h, w
+
+
+class myGaussianBlur:
+    """Random Gaussian blur on image only (tensor). Mask is unchanged."""
+    def __init__(self, p=0.3, kernel_size=3, sigma=(0.1, 1.0)):
+        self.p = p
+        self.kernel_size = kernel_size
+        self.sigma = sigma
+
+    def __call__(self, data):
+        image, mask = data
+        if random.random() < self.p:
+            sigma = random.uniform(self.sigma[0], self.sigma[1])
+            image = TF.gaussian_blur(image, self.kernel_size, [sigma, sigma])
+        return image, mask
 
 
 class myNormalize:
