@@ -6,14 +6,14 @@ from einops import rearrange
 from timm.models.layers import trunc_normal_
 import math
 
-from models.modules import CoordinateAttention, BoundaryDetectionHead, BoundaryFeedback
+from models.modules import MSDE, SGDR
 
 
 class DepthWiseConv2d(nn.Module):
     def __init__(self, dim_in, dim_out, kernel_size=3, padding=1, stride=1, dilation=1):
         super().__init__()
-        
-        self.conv1 = nn.Conv2d(dim_in, dim_in, kernel_size=kernel_size, padding=padding, 
+
+        self.conv1 = nn.Conv2d(dim_in, dim_in, kernel_size=kernel_size, padding=padding,
                       stride=stride, dilation=dilation, groups=dim_in)
         self.norm_layer = nn.GroupNorm(4, dim_in)
         self.conv2 = nn.Conv2d(dim_in, dim_out, kernel_size=1)
@@ -32,9 +32,9 @@ class LayerNorm(nn.Module):
         self.eps = eps
         self.data_format = data_format
         if self.data_format not in ["channels_last", "channels_first"]:
-            raise NotImplementedError 
+            raise NotImplementedError
         self.normalized_shape = (normalized_shape, )
-    
+
     def forward(self, x):
         if self.data_format == "channels_last":
             return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
@@ -44,7 +44,7 @@ class LayerNorm(nn.Module):
             x = (x - u) / torch.sqrt(s + self.eps)
             x = self.weight[:, None, None] * x + self.bias[:, None, None]
             return x
-    
+
 
 class group_aggregation_bridge(nn.Module):
     def __init__(self, dim_xh, dim_xl, k_size=3, d_list=[1,2,5,7]):
@@ -53,26 +53,26 @@ class group_aggregation_bridge(nn.Module):
         group_size = dim_xl // 2
         self.g0 = nn.Sequential(
             LayerNorm(normalized_shape=group_size+1, data_format='channels_first'),
-            nn.Conv2d(group_size + 1, group_size + 1, kernel_size=3, stride=1, 
-                      padding=(k_size+(k_size-1)*(d_list[0]-1))//2, 
+            nn.Conv2d(group_size + 1, group_size + 1, kernel_size=3, stride=1,
+                      padding=(k_size+(k_size-1)*(d_list[0]-1))//2,
                       dilation=d_list[0], groups=group_size + 1)
         )
         self.g1 = nn.Sequential(
             LayerNorm(normalized_shape=group_size+1, data_format='channels_first'),
-            nn.Conv2d(group_size + 1, group_size + 1, kernel_size=3, stride=1, 
-                      padding=(k_size+(k_size-1)*(d_list[1]-1))//2, 
+            nn.Conv2d(group_size + 1, group_size + 1, kernel_size=3, stride=1,
+                      padding=(k_size+(k_size-1)*(d_list[1]-1))//2,
                       dilation=d_list[1], groups=group_size + 1)
         )
         self.g2 = nn.Sequential(
             LayerNorm(normalized_shape=group_size+1, data_format='channels_first'),
-            nn.Conv2d(group_size + 1, group_size + 1, kernel_size=3, stride=1, 
-                      padding=(k_size+(k_size-1)*(d_list[2]-1))//2, 
+            nn.Conv2d(group_size + 1, group_size + 1, kernel_size=3, stride=1,
+                      padding=(k_size+(k_size-1)*(d_list[2]-1))//2,
                       dilation=d_list[2], groups=group_size + 1)
         )
         self.g3 = nn.Sequential(
             LayerNorm(normalized_shape=group_size+1, data_format='channels_first'),
-            nn.Conv2d(group_size + 1, group_size + 1, kernel_size=3, stride=1, 
-                      padding=(k_size+(k_size-1)*(d_list[3]-1))//2, 
+            nn.Conv2d(group_size + 1, group_size + 1, kernel_size=3, stride=1,
+                      padding=(k_size+(k_size-1)*(d_list[3]-1))//2,
                       dilation=d_list[3], groups=group_size + 1)
         )
         self.tail_conv = nn.Sequential(
@@ -96,11 +96,11 @@ class group_aggregation_bridge(nn.Module):
 class Grouped_multi_axis_Hadamard_Product_Attention(nn.Module):
     def __init__(self, dim_in, dim_out, x=8, y=8):
         super().__init__()
-        
+
         c_dim_in = dim_in//4
         k_size=3
         pad=(k_size-1) // 2
-        
+
         self.params_xy = nn.Parameter(torch.Tensor(1, c_dim_in, x, y), requires_grad=True)
         nn.init.ones_(self.params_xy)
         self.conv_xy = nn.Sequential(nn.Conv2d(c_dim_in, c_dim_in, kernel_size=k_size, padding=pad, groups=c_dim_in), nn.GELU(), nn.Conv2d(c_dim_in, c_dim_in, 1))
@@ -118,16 +118,16 @@ class Grouped_multi_axis_Hadamard_Product_Attention(nn.Module):
                 nn.GELU(),
                 nn.Conv2d(c_dim_in, c_dim_in, kernel_size=3, padding=1, groups=c_dim_in)
         )
-        
+
         self.norm1 = LayerNorm(dim_in, eps=1e-6, data_format='channels_first')
         self.norm2 = LayerNorm(dim_in, eps=1e-6, data_format='channels_first')
-        
+
         self.ldw = nn.Sequential(
                 nn.Conv2d(dim_in, dim_in, kernel_size=3, padding=1, groups=dim_in),
                 nn.GELU(),
                 nn.Conv2d(dim_in, dim_out, 1),
         )
-        
+
     def forward(self, x):
         x = self.norm1(x)
         x1, x2, x3, x4 = torch.chunk(x, 4, dim=1)
@@ -155,20 +155,16 @@ class Grouped_multi_axis_Hadamard_Product_Attention(nn.Module):
         return x
 
 
-
-    
-    
-
 class EGEUNet(nn.Module):
-    
+
     def __init__(self, num_classes=1, input_channels=3, c_list=[8,16,24,32,48,64],
-                 bridge=True, gt_ds=True, use_ca=False, use_boundary=False):
+                 bridge=True, gt_ds=True, use_msde=False, use_sgdr=False):
         super().__init__()
 
         self.bridge = bridge
         self.gt_ds = gt_ds
-        self.use_ca = use_ca
-        self.use_boundary = use_boundary
+        self.use_msde = use_msde
+        self.use_sgdr = use_sgdr
 
         self.encoder1 = nn.Sequential(
             nn.Conv2d(input_channels, c_list[0], 3, stride=1, padding=1),
@@ -180,11 +176,11 @@ class EGEUNet(nn.Module):
             nn.Conv2d(c_list[1], c_list[2], 3, stride=1, padding=1),
         )
 
-        if use_ca:
-            self.ca1 = CoordinateAttention(c_list[0])
-            self.ca2 = CoordinateAttention(c_list[1])
-            self.ca3 = CoordinateAttention(c_list[2])
-            print('Coordinate Attention was used on encoder 1-3')
+        if use_msde:
+            self.msde1 = MSDE(c_list[0])
+            self.msde2 = MSDE(c_list[1])
+            self.msde3 = MSDE(c_list[2])
+            print('MSDE was used on encoder 1-3')
         self.encoder4 = nn.Sequential(
             Grouped_multi_axis_Hadamard_Product_Attention(c_list[2], c_list[3]),
         )
@@ -210,29 +206,25 @@ class EGEUNet(nn.Module):
             self.gt_conv5 = nn.Sequential(nn.Conv2d(c_list[0], 1, 1))
             print('gt deep supervision was used')
 
-        if use_boundary:
-            # Multi-scale boundary heads: H/8 (coarse) + H/2 (fine)
-            self.boundary_head_coarse = BoundaryDetectionHead(c_list[2])  # c2, H/8
-            self.boundary_head_fine = BoundaryDetectionHead(c_list[0])    # c0, H/2
-            # Boundary feedback: inject boundary info back into decoder
-            self.boundary_feedback = BoundaryFeedback(c_list[2])          # at H/8 level
-            print('Boundary-Aware Supervision was used (multi-scale + feedback)')
+        if use_sgdr:
+            self.sgdr = SGDR(c_list[0])  # at H/2 scale (c0=8)
+            print('SGDR was used at decoder H/2 output')
 
         self.decoder1 = nn.Sequential(
             Grouped_multi_axis_Hadamard_Product_Attention(c_list[5], c_list[4]),
-        ) 
+        )
         self.decoder2 = nn.Sequential(
             Grouped_multi_axis_Hadamard_Product_Attention(c_list[4], c_list[3]),
-        ) 
+        )
         self.decoder3 = nn.Sequential(
             Grouped_multi_axis_Hadamard_Product_Attention(c_list[3], c_list[2]),
-        )  
+        )
         self.decoder4 = nn.Sequential(
             nn.Conv2d(c_list[2], c_list[1], 3, stride=1, padding=1),
-        )  
+        )
         self.decoder5 = nn.Sequential(
             nn.Conv2d(c_list[1], c_list[0], 3, stride=1, padding=1),
-        )  
+        )
         self.ebn1 = nn.GroupNorm(4, c_list[0])
         self.ebn2 = nn.GroupNorm(4, c_list[1])
         self.ebn3 = nn.GroupNorm(4, c_list[2])
@@ -266,20 +258,20 @@ class EGEUNet(nn.Module):
     def forward(self, x):
 
         out = self.encoder1(x)
-        if self.use_ca:
-            out = self.ca1(out)
+        if self.use_msde:
+            out = self.msde1(out)
         out = F.gelu(F.max_pool2d(self.ebn1(out),2,2))
         t1 = out # b, c0, H/2, W/2
 
         out = self.encoder2(out)
-        if self.use_ca:
-            out = self.ca2(out)
+        if self.use_msde:
+            out = self.msde2(out)
         out = F.gelu(F.max_pool2d(self.ebn2(out),2,2))
         t2 = out # b, c1, H/4, W/4
 
         out = self.encoder3(out)
-        if self.use_ca:
-            out = self.ca3(out)
+        if self.use_msde:
+            out = self.msde3(out)
         out = F.gelu(F.max_pool2d(self.ebn3(out),2,2))
         t3 = out # b, c2, H/8, W/8
 
@@ -316,12 +308,6 @@ class EGEUNet(nn.Module):
         else: t3 = self.GAB3(t4, t3)
         out3 = torch.add(out3, t3) # b, c2, H/8, W/8
 
-        # Boundary detection at H/8 scale (coarse) + feedback
-        boundary_out = None
-        if self.use_boundary:
-            bd_coarse = self.boundary_head_coarse(out3)  # (B, 1, H/8, W/8)
-            out3 = self.boundary_feedback(out3, bd_coarse)  # inject boundary info back
-
         out2 = F.gelu(F.interpolate(self.dbn4(self.decoder4(out3)),scale_factor=(2,2),mode ='bilinear',align_corners=True)) # b, c1, H/4, W/4
         if self.gt_ds:
             gt_pre2 = self.gt_conv4(out2)
@@ -338,10 +324,10 @@ class EGEUNet(nn.Module):
         else: t1 = self.GAB1(t2, t1)
         out1 = torch.add(out1, t1) # b, c0, H/2, W/2
 
-        # Boundary detection at H/2 scale (fine) + collect multi-scale outputs
-        if self.use_boundary:
-            bd_fine = self.boundary_head_fine(out1)  # (B, 1, H/2, W/2)
-            boundary_out = (bd_coarse, bd_fine)  # multi-scale boundary logits
+        # SGDR: feature refinement + boundary guidance at H/2
+        boundary_out = None
+        if self.use_sgdr:
+            out1, boundary_out = self.sgdr(out1)
 
         out0 = F.interpolate(self.final(out1),scale_factor=(2,2),mode ='bilinear',align_corners=True) # b, num_class, H, W
 

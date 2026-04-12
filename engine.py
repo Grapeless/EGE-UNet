@@ -1,4 +1,5 @@
 import numpy as np
+import random
 from tqdm import tqdm
 import torch
 import torch.nn.functional as F
@@ -68,6 +69,14 @@ def train_one_epoch(train_loader,
         optimizer.zero_grad()
         images, targets = data
         images, targets = images.cuda(non_blocking=True).float(), targets.cuda(non_blocking=True).float()
+
+        # Mixup augmentation (30% probability)
+        use_mixup = getattr(config, 'use_mixup', False)
+        if use_mixup and random.random() < 0.3:
+            lam = np.random.beta(0.2, 0.2)
+            index = torch.randperm(images.size(0)).cuda()
+            images = lam * images + (1 - lam) * images[index]
+            targets = lam * targets + (1 - lam) * targets[index]
 
         gt_pre, out, boundary_out = model(images)
         if boundary_out is not None:

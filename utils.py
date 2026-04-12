@@ -316,10 +316,82 @@ class GT_BceDiceLoss(nn.Module):
         return bcediceloss + gt_loss
 
 
-class GT_BceDiceLoss_WithBoundary(nn.Module):
-    """GT_BceDiceLoss extended with multi-scale boundary-aware supervision."""
+class TverskyLoss(nn.Module):
+    """Tversky loss with asymmetric FP/FN weighting.
+    beta > alpha penalizes false negatives more, improving sensitivity."""
 
-    def __init__(self, wb=1, wd=1, boundary_weight=0.5):
+    def __init__(self, alpha=0.3, beta=0.7, smooth=1.0):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.smooth = smooth
+
+    def forward(self, pred, target):
+        size = pred.size(0)
+        pred_ = pred.view(size, -1)
+        target_ = target.view(size, -1)
+
+        TP = (pred_ * target_).sum(1)
+        FP = (pred_ * (1 - target_)).sum(1)
+        FN = ((1 - pred_) * target_).sum(1)
+
+        tversky = (TP + self.smooth) / (TP + self.alpha * FP + self.beta * FN + self.smooth)
+        return 1 - tversky.sum() / size
+
+
+class TverskyDiceLoss(nn.Module):
+    """Tversky + Dice combined loss for DSC-focused optimization."""
+
+    def __init__(self, wt=1, wd=1, alpha=0.3, beta=0.7):
+        super().__init__()
+        self.tversky = TverskyLoss(alpha=alpha, beta=beta)
+        self.dice = DiceLoss()
+        self.wt = wt
+        self.wd = wd
+
+    def forward(self, pred, target):
+        return self.wt * self.tversky(pred, target) + self.wd * self.dice(pred, target)
+
+
+class GT_TverskyDiceLoss_WithSGDR(nn.Module):
+    """GT deep supervision with Tversky+Dice loss + SGDR boundary supervision."""
+
+    def __init__(self, wt=1, wd=1, alpha=0.3, beta=0.7, boundary_weight=0.3):
+        super().__init__()
+        self.main_loss = TverskyDiceLoss(wt=wt, wd=wd, alpha=alpha, beta=beta)
+        self.boundary_weight = boundary_weight
+        from models.modules import BoundaryLoss, generate_boundary_gt
+        self.boundary_loss_fn = BoundaryLoss(bce_weight=0.5, dice_weight=0.5)
+        self.generate_boundary_gt = generate_boundary_gt
+
+    def forward(self, gt_pre, out, target, boundary_logits=None):
+        main_loss = self.main_loss(out, target)
+        gt_pre5, gt_pre4, gt_pre3, gt_pre2, gt_pre1 = gt_pre
+        gt_loss = (self.main_loss(gt_pre5, target) * 0.1
+                   + self.main_loss(gt_pre4, target) * 0.2
+                   + self.main_loss(gt_pre3, target) * 0.3
+                   + self.main_loss(gt_pre2, target) * 0.4
+                   + self.main_loss(gt_pre1, target) * 0.5)
+
+        total_loss = main_loss + gt_loss
+
+        if boundary_logits is not None:
+            boundary_gt = self.generate_boundary_gt(target, dilation_radius=2)
+            if isinstance(boundary_logits, tuple):
+                bd_coarse, bd_fine = boundary_logits
+                b_loss = 0.3 * self.boundary_loss_fn(bd_coarse, boundary_gt) + 0.7 * self.boundary_loss_fn(bd_fine, boundary_gt)
+            else:
+                b_loss = self.boundary_loss_fn(boundary_logits, boundary_gt)
+            total_loss = total_loss + self.boundary_weight * b_loss
+
+        return total_loss
+
+
+class GT_BceDiceLoss_WithSGDR(nn.Module):
+    """GT deep supervision with BCE+Dice loss + SGDR boundary supervision.
+    Used for ablation where we want SGDR but not Tversky."""
+
+    def __init__(self, wb=1, wd=1, boundary_weight=0.3):
         super().__init__()
         self.bcedice = BceDiceLoss(wb, wd)
         self.boundary_weight = boundary_weight
@@ -339,21 +411,15 @@ class GT_BceDiceLoss_WithBoundary(nn.Module):
         total_loss = bcediceloss + gt_loss
 
         if boundary_logits is not None:
-            boundary_gt = self.generate_boundary_gt(target, dilation_radius=3)
-            # boundary_logits is a tuple: (bd_coarse_H/8, bd_fine_H/2)
+            boundary_gt = self.generate_boundary_gt(target, dilation_radius=2)
             if isinstance(boundary_logits, tuple):
                 bd_coarse, bd_fine = boundary_logits
-                # Coarse boundary loss (H/8, weight 0.3)
-                b_loss_coarse = self.boundary_loss_fn(bd_coarse, boundary_gt)
-                # Fine boundary loss (H/2, weight 0.7)
-                b_loss_fine = self.boundary_loss_fn(bd_fine, boundary_gt)
-                b_loss = 0.3 * b_loss_coarse + 0.7 * b_loss_fine
+                b_loss = 0.3 * self.boundary_loss_fn(bd_coarse, boundary_gt) + 0.7 * self.boundary_loss_fn(bd_fine, boundary_gt)
             else:
                 b_loss = self.boundary_loss_fn(boundary_logits, boundary_gt)
             total_loss = total_loss + self.boundary_weight * b_loss
 
         return total_loss
-
 
 
 class myToTensor:
@@ -393,12 +459,14 @@ class myRandomVerticalFlip:
 
 class myRandomRotation:
     def __init__(self, p=0.5, degree=[0,360]):
-        self.angle = random.uniform(degree[0], degree[1])
+        self.degree = degree
         self.p = p
     def __call__(self, data):
         image, mask = data
-        if random.random() < self.p: return TF.rotate(image,self.angle), TF.rotate(mask,self.angle)
-        else: return image, mask 
+        if random.random() < self.p:
+            angle = random.uniform(self.degree[0], self.degree[1])
+            return TF.rotate(image, angle), TF.rotate(mask, angle)
+        return image, mask
 
 
 class myColorJitter:

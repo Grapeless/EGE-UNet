@@ -77,8 +77,8 @@ def main(config):
                         c_list=model_cfg['c_list'],
                         bridge=model_cfg['bridge'],
                         gt_ds=model_cfg['gt_ds'],
-                        use_ca=model_cfg.get('use_ca', False),
-                        use_boundary=model_cfg.get('use_boundary', False),
+                        use_msde=model_cfg.get('use_msde', False),
+                        use_sgdr=model_cfg.get('use_sgdr', False),
                         )
     else: raise Exception('network in not right!')
     model = model.cuda()

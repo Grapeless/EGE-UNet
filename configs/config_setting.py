@@ -1,6 +1,6 @@
 from torchvision import transforms
 from utils import *
-from utils import GT_BceDiceLoss_WithBoundary
+from utils import GT_BceDiceLoss_WithSGDR, GT_TverskyDiceLoss_WithSGDR
 from utils import myColorJitter, myRandomResizedCrop, myGaussianBlur
 
 from datetime import datetime, timezone, timedelta
@@ -17,11 +17,17 @@ class setting_config:
         'c_list': [8,16,24,32,48,64],
         'bridge': True,
         'gt_ds': True,
-        'use_ca': True,        # Coordinate Attention on encoder 1-3
-        'use_boundary': True,  # Boundary-Aware Supervision
+        'use_msde': True,       # Multi-Scale Depthwise Enhancement on encoder 1-3
+        'use_sgdr': True,       # Semantic-Guided Decoder Refinement at H/2
     }
 
-    datasets = 'isic18' 
+    # Loss function selection: 'bcedice', 'bcedice_sgdr', 'tversky_sgdr'
+    loss_type = 'tversky_sgdr'
+
+    # Mixup augmentation
+    use_mixup = True
+
+    datasets = 'isic18'
     if datasets == 'isic18':
         data_path = './data/isic2018/'
     elif datasets == 'isic17':
@@ -29,9 +35,11 @@ class setting_config:
     else:
         raise Exception('datasets in not right!')
 
-    # Criterion: auto-select based on use_boundary flag
-    if model_config.get('use_boundary', False):
-        criterion = GT_BceDiceLoss_WithBoundary(wb=1, wd=1, boundary_weight=0.5)
+    # Criterion: auto-select based on loss_type
+    if loss_type == 'tversky_sgdr':
+        criterion = GT_TverskyDiceLoss_WithSGDR(wt=1, wd=1, alpha=0.3, beta=0.7, boundary_weight=0.3)
+    elif loss_type == 'bcedice_sgdr':
+        criterion = GT_BceDiceLoss_WithSGDR(wb=1, wd=1, boundary_weight=0.3)
     else:
         criterion = GT_BceDiceLoss(wb=1, wd=1)
 
@@ -56,7 +64,15 @@ class setting_config:
     warmup_epochs = 10
     warmup_start_factor = 0.01
 
-    work_dir = 'results/' + network + '_' + datasets + '_' + datetime.now(timezone(timedelta(hours=8))).strftime('%A_%d_%B_%Y_%Hh_%Mm_%Ss') + '/'
+    # To resume training, set resume_dir to an existing results directory.
+    # Set to None to start a new training run with a timestamped directory.
+    # resume_dir = 'results/egeunet_isic18_Friday_10_April_2026_20h_52m_31s/'
+    resume_dir = None
+
+    if resume_dir:
+        work_dir = resume_dir
+    else:
+        work_dir = 'results/' + network + '_' + datasets + '_' + datetime.now(timezone(timedelta(hours=8))).strftime('%A_%d_%B_%Y_%Hh_%Mm_%Ss') + '/'
 
     print_interval = 20
     val_interval = 30
