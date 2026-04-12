@@ -17,7 +17,7 @@ class setting_config:
         'gt_ds': True,
     }
 
-    datasets = 'isic17' 
+    datasets = 'isic18' 
     if datasets == 'isic18':
         data_path = './data/isic2018/'
     elif datasets == 'isic17':
@@ -34,11 +34,11 @@ class setting_config:
     input_channels = 3
     distributed = False
     local_rank = -1
-    num_workers = 0
+    num_workers = 18
     seed = 42
     world_size = None
     rank = None
-    amp = False
+    amp = True
     gpu_id = '0'
     batch_size = 8
     epochs = 300
