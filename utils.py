@@ -303,11 +303,47 @@ class GT_BceDiceLoss(nn.Module):
         super(GT_BceDiceLoss, self).__init__()
         self.bcedice = BceDiceLoss(wb, wd)
 
-    def forward(self, gt_pre, out, target):
+    def forward(self, gt_pre, out, target, boundary_logits=None):
         bcediceloss = self.bcedice(out, target)
         gt_pre5, gt_pre4, gt_pre3, gt_pre2, gt_pre1 = gt_pre
         gt_loss = self.bcedice(gt_pre5, target) * 0.1 + self.bcedice(gt_pre4, target) * 0.2 + self.bcedice(gt_pre3, target) * 0.3 + self.bcedice(gt_pre2, target) * 0.4 + self.bcedice(gt_pre1, target) * 0.5
         return bcediceloss + gt_loss
+
+
+class GT_BceDiceLoss_WithBoundary(nn.Module):
+    """GT_BceDiceLoss extended with multi-scale boundary-aware supervision."""
+
+    def __init__(self, wb=1, wd=1, boundary_weight=0.5):
+        super().__init__()
+        self.bcedice = BceDiceLoss(wb, wd)
+        self.boundary_weight = boundary_weight
+        from models.modules import BoundaryLoss, generate_boundary_gt
+        self.boundary_loss_fn = BoundaryLoss(bce_weight=0.5, dice_weight=0.5)
+        self.generate_boundary_gt = generate_boundary_gt
+
+    def forward(self, gt_pre, out, target, boundary_logits=None):
+        bcediceloss = self.bcedice(out, target)
+        gt_pre5, gt_pre4, gt_pre3, gt_pre2, gt_pre1 = gt_pre
+        gt_loss = (self.bcedice(gt_pre5, target) * 0.1
+                   + self.bcedice(gt_pre4, target) * 0.2
+                   + self.bcedice(gt_pre3, target) * 0.3
+                   + self.bcedice(gt_pre2, target) * 0.4
+                   + self.bcedice(gt_pre1, target) * 0.5)
+
+        total_loss = bcediceloss + gt_loss
+
+        if boundary_logits is not None:
+            boundary_gt = self.generate_boundary_gt(target, dilation_radius=3)
+            if isinstance(boundary_logits, tuple):
+                bd_coarse, bd_fine = boundary_logits
+                b_loss_coarse = self.boundary_loss_fn(bd_coarse, boundary_gt)
+                b_loss_fine = self.boundary_loss_fn(bd_fine, boundary_gt)
+                b_loss = 0.3 * b_loss_coarse + 0.7 * b_loss_fine
+            else:
+                b_loss = self.boundary_loss_fn(boundary_logits, boundary_gt)
+            total_loss = total_loss + self.boundary_weight * b_loss
+
+        return total_loss
 
 
 

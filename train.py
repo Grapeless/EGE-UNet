@@ -174,6 +174,15 @@ def main(config):
                 logger,
                 config,
             )
+        # TTA test
+        loss = test_one_epoch(
+                val_loader,
+                model,
+                criterion,
+                logger,
+                config,
+                use_tta=True,
+            )
         os.rename(
             os.path.join(checkpoint_dir, 'best.pth'),
             os.path.join(checkpoint_dir, f'best-epoch{min_epoch}-loss{min_loss:.4f}.pth')

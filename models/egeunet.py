@@ -6,12 +6,103 @@ from einops import rearrange
 from timm.models.layers import trunc_normal_
 import math
 
+from models.modules import CoordinateAttention, BoundaryDetectionHead, BoundaryFeedback
+
+
+# ============================================================
+# Wavelet Frequency-Domain Feature Enhancement
+# Reference: WaveSNet (2024), Wavelet-enhanced UNet series
+# ============================================================
+
+class HaarWavelet2D:
+    """
+    Haar Wavelet 2D Transform using fixed filters (no learnable params).
+    Implements DWT and IDWT as strided convolutions.
+    """
+    @staticmethod
+    def dwt(x):
+        """
+        2D Haar Discrete Wavelet Transform.
+        x: (B, C, H, W) -> LL, LH, HL, HH each (B, C, H/2, W/2)
+        """
+        x_ll = (x[:, :, 0::2, 0::2] + x[:, :, 0::2, 1::2] +
+                x[:, :, 1::2, 0::2] + x[:, :, 1::2, 1::2]) / 4.0
+        x_lh = (x[:, :, 0::2, 0::2] + x[:, :, 0::2, 1::2] -
+                x[:, :, 1::2, 0::2] - x[:, :, 1::2, 1::2]) / 4.0
+        x_hl = (x[:, :, 0::2, 0::2] - x[:, :, 0::2, 1::2] +
+                x[:, :, 1::2, 0::2] - x[:, :, 1::2, 1::2]) / 4.0
+        x_hh = (x[:, :, 0::2, 0::2] - x[:, :, 0::2, 1::2] -
+                x[:, :, 1::2, 0::2] + x[:, :, 1::2, 1::2]) / 4.0
+        return x_ll, x_lh, x_hl, x_hh
+
+    @staticmethod
+    def idwt(ll, lh, hl, hh):
+        """
+        2D Haar Inverse Discrete Wavelet Transform.
+        ll, lh, hl, hh: each (B, C, H/2, W/2) -> (B, C, H, W)
+        """
+        B, C, H2, W2 = ll.shape
+        H, W = H2 * 2, W2 * 2
+        x = torch.zeros(B, C, H, W, device=ll.device, dtype=ll.dtype)
+        x[:, :, 0::2, 0::2] = ll + lh + hl + hh
+        x[:, :, 0::2, 1::2] = ll + lh - hl - hh
+        x[:, :, 1::2, 0::2] = ll - lh + hl - hh
+        x[:, :, 1::2, 1::2] = ll - lh - hl + hh
+        return x
+
+
+class WaveletFeatureEnhance(nn.Module):
+    """
+    Wavelet-based frequency-domain feature enhancement.
+    Decomposes features into frequency sub-bands, enhances high-frequency
+    (edge/boundary) components with learnable scaling, then reconstructs.
+    """
+    def __init__(self, channels):
+        super().__init__()
+        # Low-frequency path: preserve region consistency
+        self.low_conv = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels),
+            nn.GELU(),
+        )
+        # High-frequency path: enhance edge/boundary details
+        self.high_conv = nn.Sequential(
+            nn.Conv2d(channels * 3, channels * 3, kernel_size=3, padding=1, groups=channels * 3),
+            nn.GELU(),
+            nn.Conv2d(channels * 3, channels * 3, kernel_size=1),
+        )
+        # Learnable high-frequency scaling factor
+        self.alpha = nn.Parameter(torch.tensor([0.5]))
+
+    def forward(self, x):
+        """x: (B, C, H, W)"""
+        # Haar DWT decomposition
+        ll, lh, hl, hh = HaarWavelet2D.dwt(x)
+
+        # Process low-frequency (region consistency)
+        ll_enhanced = ll + self.low_conv(ll)
+
+        # Process high-frequency (boundary enhancement)
+        # alpha scales only the LEARNED adjustment, preserving original high-freq
+        high = torch.cat([lh, hl, hh], dim=1)  # (B, 3C, H/2, W/2)
+        high_enhanced = high + self.alpha * self.high_conv(high)
+
+        # Split back to individual high-frequency sub-bands
+        C = x.shape[1]
+        lh_e, hl_e, hh_e = high_enhanced.split(C, dim=1)
+
+        # Reconstruct via IDWT
+        return HaarWavelet2D.idwt(ll_enhanced, lh_e, hl_e, hh_e)
+
+
+# ============================================================
+# Original EGE-UNet building blocks
+# ============================================================
 
 class DepthWiseConv2d(nn.Module):
     def __init__(self, dim_in, dim_out, kernel_size=3, padding=1, stride=1, dilation=1):
         super().__init__()
-        
-        self.conv1 = nn.Conv2d(dim_in, dim_in, kernel_size=kernel_size, padding=padding, 
+
+        self.conv1 = nn.Conv2d(dim_in, dim_in, kernel_size=kernel_size, padding=padding,
                       stride=stride, dilation=dilation, groups=dim_in)
         self.norm_layer = nn.GroupNorm(4, dim_in)
         self.conv2 = nn.Conv2d(dim_in, dim_out, kernel_size=1)
@@ -30,9 +121,9 @@ class LayerNorm(nn.Module):
         self.eps = eps
         self.data_format = data_format
         if self.data_format not in ["channels_last", "channels_first"]:
-            raise NotImplementedError 
+            raise NotImplementedError
         self.normalized_shape = (normalized_shape, )
-    
+
     def forward(self, x):
         if self.data_format == "channels_last":
             return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
@@ -42,7 +133,7 @@ class LayerNorm(nn.Module):
             x = (x - u) / torch.sqrt(s + self.eps)
             x = self.weight[:, None, None] * x + self.bias[:, None, None]
             return x
-    
+
 
 class group_aggregation_bridge(nn.Module):
     def __init__(self, dim_xh, dim_xl, k_size=3, d_list=[1,2,5,7]):
@@ -51,26 +142,26 @@ class group_aggregation_bridge(nn.Module):
         group_size = dim_xl // 2
         self.g0 = nn.Sequential(
             LayerNorm(normalized_shape=group_size+1, data_format='channels_first'),
-            nn.Conv2d(group_size + 1, group_size + 1, kernel_size=3, stride=1, 
-                      padding=(k_size+(k_size-1)*(d_list[0]-1))//2, 
+            nn.Conv2d(group_size + 1, group_size + 1, kernel_size=3, stride=1,
+                      padding=(k_size+(k_size-1)*(d_list[0]-1))//2,
                       dilation=d_list[0], groups=group_size + 1)
         )
         self.g1 = nn.Sequential(
             LayerNorm(normalized_shape=group_size+1, data_format='channels_first'),
-            nn.Conv2d(group_size + 1, group_size + 1, kernel_size=3, stride=1, 
-                      padding=(k_size+(k_size-1)*(d_list[1]-1))//2, 
+            nn.Conv2d(group_size + 1, group_size + 1, kernel_size=3, stride=1,
+                      padding=(k_size+(k_size-1)*(d_list[1]-1))//2,
                       dilation=d_list[1], groups=group_size + 1)
         )
         self.g2 = nn.Sequential(
             LayerNorm(normalized_shape=group_size+1, data_format='channels_first'),
-            nn.Conv2d(group_size + 1, group_size + 1, kernel_size=3, stride=1, 
-                      padding=(k_size+(k_size-1)*(d_list[2]-1))//2, 
+            nn.Conv2d(group_size + 1, group_size + 1, kernel_size=3, stride=1,
+                      padding=(k_size+(k_size-1)*(d_list[2]-1))//2,
                       dilation=d_list[2], groups=group_size + 1)
         )
         self.g3 = nn.Sequential(
             LayerNorm(normalized_shape=group_size+1, data_format='channels_first'),
-            nn.Conv2d(group_size + 1, group_size + 1, kernel_size=3, stride=1, 
-                      padding=(k_size+(k_size-1)*(d_list[3]-1))//2, 
+            nn.Conv2d(group_size + 1, group_size + 1, kernel_size=3, stride=1,
+                      padding=(k_size+(k_size-1)*(d_list[3]-1))//2,
                       dilation=d_list[3], groups=group_size + 1)
         )
         self.tail_conv = nn.Sequential(
@@ -94,11 +185,11 @@ class group_aggregation_bridge(nn.Module):
 class Grouped_multi_axis_Hadamard_Product_Attention(nn.Module):
     def __init__(self, dim_in, dim_out, x=8, y=8):
         super().__init__()
-        
+
         c_dim_in = dim_in//4
         k_size=3
         pad=(k_size-1) // 2
-        
+
         self.params_xy = nn.Parameter(torch.Tensor(1, c_dim_in, x, y), requires_grad=True)
         nn.init.ones_(self.params_xy)
         self.conv_xy = nn.Sequential(nn.Conv2d(c_dim_in, c_dim_in, kernel_size=k_size, padding=pad, groups=c_dim_in), nn.GELU(), nn.Conv2d(c_dim_in, c_dim_in, 1))
@@ -116,16 +207,16 @@ class Grouped_multi_axis_Hadamard_Product_Attention(nn.Module):
                 nn.GELU(),
                 nn.Conv2d(c_dim_in, c_dim_in, kernel_size=3, padding=1, groups=c_dim_in)
         )
-        
+
         self.norm1 = LayerNorm(dim_in, eps=1e-6, data_format='channels_first')
         self.norm2 = LayerNorm(dim_in, eps=1e-6, data_format='channels_first')
-        
+
         self.ldw = nn.Sequential(
                 nn.Conv2d(dim_in, dim_in, kernel_size=3, padding=1, groups=dim_in),
                 nn.GELU(),
                 nn.Conv2d(dim_in, dim_out, 1),
         )
-        
+
     def forward(self, x):
         x = self.norm1(x)
         x1, x2, x3, x4 = torch.chunk(x, 4, dim=1)
@@ -153,27 +244,39 @@ class Grouped_multi_axis_Hadamard_Product_Attention(nn.Module):
         return x
 
 
-
-    
-    
+# ============================================================
+# Main Model
+# ============================================================
 
 class EGEUNet(nn.Module):
-    
-    def __init__(self, num_classes=1, input_channels=3, c_list=[8,16,24,32,48,64], bridge=True, gt_ds=True):
+
+    def __init__(self, num_classes=1, input_channels=3, c_list=[8,16,24,32,48,64],
+                 bridge=True, gt_ds=True, use_ca=False, use_boundary=False, use_wavelet=False):
         super().__init__()
 
         self.bridge = bridge
         self.gt_ds = gt_ds
-        
+        self.use_ca = use_ca
+        self.use_boundary = use_boundary
+        self.use_wavelet = use_wavelet
+
         self.encoder1 = nn.Sequential(
             nn.Conv2d(input_channels, c_list[0], 3, stride=1, padding=1),
         )
-        self.encoder2 =nn.Sequential(
+        self.encoder2 = nn.Sequential(
             nn.Conv2d(c_list[0], c_list[1], 3, stride=1, padding=1),
-        ) 
+        )
         self.encoder3 = nn.Sequential(
             nn.Conv2d(c_list[1], c_list[2], 3, stride=1, padding=1),
         )
+
+        # Coordinate Attention on shallow encoders
+        if use_ca:
+            self.ca1 = CoordinateAttention(c_list[0])
+            self.ca2 = CoordinateAttention(c_list[1])
+            self.ca3 = CoordinateAttention(c_list[2])
+            print('Coordinate Attention was used on encoder 1-3')
+
         self.encoder4 = nn.Sequential(
             Grouped_multi_axis_Hadamard_Product_Attention(c_list[2], c_list[3]),
         )
@@ -184,7 +287,7 @@ class EGEUNet(nn.Module):
             Grouped_multi_axis_Hadamard_Product_Attention(c_list[4], c_list[5]),
         )
 
-        if bridge: 
+        if bridge:
             self.GAB1 = group_aggregation_bridge(c_list[1], c_list[0])
             self.GAB2 = group_aggregation_bridge(c_list[2], c_list[1])
             self.GAB3 = group_aggregation_bridge(c_list[3], c_list[2])
@@ -198,22 +301,35 @@ class EGEUNet(nn.Module):
             self.gt_conv4 = nn.Sequential(nn.Conv2d(c_list[1], 1, 1))
             self.gt_conv5 = nn.Sequential(nn.Conv2d(c_list[0], 1, 1))
             print('gt deep supervision was used')
-        
+
+        # Boundary-Aware Supervision
+        if use_boundary:
+            self.boundary_head_coarse = BoundaryDetectionHead(c_list[2])  # c2=24, H/8
+            self.boundary_head_fine = BoundaryDetectionHead(c_list[0])    # c0=8, H/2
+            self.boundary_feedback = BoundaryFeedback(c_list[2])          # at H/8 level
+            print('Boundary-Aware Supervision was used (multi-scale + feedback)')
+
+        # Wavelet Feature Enhancement on skip connections
+        if use_wavelet:
+            self.wave_enhance1 = WaveletFeatureEnhance(c_list[0])  # 8ch, applied to t1
+            self.wave_enhance2 = WaveletFeatureEnhance(c_list[1])  # 16ch, applied to t2
+            print('Wavelet feature enhancement was used')
+
         self.decoder1 = nn.Sequential(
             Grouped_multi_axis_Hadamard_Product_Attention(c_list[5], c_list[4]),
-        ) 
+        )
         self.decoder2 = nn.Sequential(
             Grouped_multi_axis_Hadamard_Product_Attention(c_list[4], c_list[3]),
-        ) 
+        )
         self.decoder3 = nn.Sequential(
             Grouped_multi_axis_Hadamard_Product_Attention(c_list[3], c_list[2]),
-        )  
+        )
         self.decoder4 = nn.Sequential(
             nn.Conv2d(c_list[2], c_list[1], 3, stride=1, padding=1),
-        )  
+        )
         self.decoder5 = nn.Sequential(
             nn.Conv2d(c_list[1], c_list[0], 3, stride=1, padding=1),
-        )  
+        )
         self.ebn1 = nn.GroupNorm(4, c_list[0])
         self.ebn2 = nn.GroupNorm(4, c_list[1])
         self.ebn3 = nn.GroupNorm(4, c_list[2])
@@ -245,68 +361,101 @@ class EGEUNet(nn.Module):
                 m.bias.data.zero_()
 
     def forward(self, x):
-        
-        out = F.gelu(F.max_pool2d(self.ebn1(self.encoder1(x)),2,2))
-        t1 = out # b, c0, H/2, W/2
 
-        out = F.gelu(F.max_pool2d(self.ebn2(self.encoder2(out)),2,2))
-        t2 = out # b, c1, H/4, W/4 
+        # Encoder with optional Coordinate Attention on shallow layers
+        out = self.encoder1(x)
+        if self.use_ca:
+            out = self.ca1(out)
+        out = F.gelu(F.max_pool2d(self.ebn1(out), 2, 2))
+        t1 = out  # b, c0, H/2, W/2
 
-        out = F.gelu(F.max_pool2d(self.ebn3(self.encoder3(out)),2,2))
-        t3 = out # b, c2, H/8, W/8
-        
-        out = F.gelu(F.max_pool2d(self.ebn4(self.encoder4(out)),2,2))
-        t4 = out # b, c3, H/16, W/16
-        
-        out = F.gelu(F.max_pool2d(self.ebn5(self.encoder5(out)),2,2))
-        t5 = out # b, c4, H/32, W/32
-        
-        out = F.gelu(self.encoder6(out)) # b, c5, H/32, W/32
+        out = self.encoder2(out)
+        if self.use_ca:
+            out = self.ca2(out)
+        out = F.gelu(F.max_pool2d(self.ebn2(out), 2, 2))
+        t2 = out  # b, c1, H/4, W/4
+
+        out = self.encoder3(out)
+        if self.use_ca:
+            out = self.ca3(out)
+        out = F.gelu(F.max_pool2d(self.ebn3(out), 2, 2))
+        t3 = out  # b, c2, H/8, W/8
+
+        out = F.gelu(F.max_pool2d(self.ebn4(self.encoder4(out)), 2, 2))
+        t4 = out  # b, c3, H/16, W/16
+
+        out = F.gelu(F.max_pool2d(self.ebn5(self.encoder5(out)), 2, 2))
+        t5 = out  # b, c4, H/32, W/32
+
+        out = F.gelu(self.encoder6(out))  # b, c5, H/32, W/32
         t6 = out
-        
-        out5 = F.gelu(self.dbn1(self.decoder1(out))) # b, c4, H/32, W/32
-        if self.gt_ds: 
+
+        # Decoder
+        out5 = F.gelu(self.dbn1(self.decoder1(out)))  # b, c4, H/32, W/32
+        if self.gt_ds:
             gt_pre5 = self.gt_conv1(out5)
             t5 = self.GAB5(t6, t5, gt_pre5)
-            gt_pre5 = F.interpolate(gt_pre5, scale_factor=32, mode ='bilinear', align_corners=True)
-        else: t5 = self.GAB5(t6, t5)
-        out5 = torch.add(out5, t5) # b, c4, H/32, W/32
-        
-        out4 = F.gelu(F.interpolate(self.dbn2(self.decoder2(out5)),scale_factor=(2,2),mode ='bilinear',align_corners=True)) # b, c3, H/16, W/16
-        if self.gt_ds: 
+            gt_pre5 = F.interpolate(gt_pre5, scale_factor=32, mode='bilinear', align_corners=True)
+        else:
+            t5 = self.GAB5(t6, t5)
+        out5 = torch.add(out5, t5)  # b, c4, H/32, W/32
+
+        out4 = F.gelu(F.interpolate(self.dbn2(self.decoder2(out5)), scale_factor=(2, 2), mode='bilinear', align_corners=True))  # b, c3, H/16, W/16
+        if self.gt_ds:
             gt_pre4 = self.gt_conv2(out4)
             t4 = self.GAB4(t5, t4, gt_pre4)
-            gt_pre4 = F.interpolate(gt_pre4, scale_factor=16, mode ='bilinear', align_corners=True)
-        else:t4 = self.GAB4(t5, t4)
-        out4 = torch.add(out4, t4) # b, c3, H/16, W/16
-        
-        out3 = F.gelu(F.interpolate(self.dbn3(self.decoder3(out4)),scale_factor=(2,2),mode ='bilinear',align_corners=True)) # b, c2, H/8, W/8
-        if self.gt_ds: 
+            gt_pre4 = F.interpolate(gt_pre4, scale_factor=16, mode='bilinear', align_corners=True)
+        else:
+            t4 = self.GAB4(t5, t4)
+        out4 = torch.add(out4, t4)  # b, c3, H/16, W/16
+
+        out3 = F.gelu(F.interpolate(self.dbn3(self.decoder3(out4)), scale_factor=(2, 2), mode='bilinear', align_corners=True))  # b, c2, H/8, W/8
+        if self.gt_ds:
             gt_pre3 = self.gt_conv3(out3)
             t3 = self.GAB3(t4, t3, gt_pre3)
-            gt_pre3 = F.interpolate(gt_pre3, scale_factor=8, mode ='bilinear', align_corners=True)
-        else: t3 = self.GAB3(t4, t3)
-        out3 = torch.add(out3, t3) # b, c2, H/8, W/8
-        
-        out2 = F.gelu(F.interpolate(self.dbn4(self.decoder4(out3)),scale_factor=(2,2),mode ='bilinear',align_corners=True)) # b, c1, H/4, W/4
-        if self.gt_ds: 
+            gt_pre3 = F.interpolate(gt_pre3, scale_factor=8, mode='bilinear', align_corners=True)
+        else:
+            t3 = self.GAB3(t4, t3)
+        out3 = torch.add(out3, t3)  # b, c2, H/8, W/8
+
+        # Boundary detection at H/8 scale (coarse) + feedback
+        boundary_out = None
+        if self.use_boundary:
+            bd_coarse = self.boundary_head_coarse(out3)  # (B, 1, H/8, W/8)
+            out3 = self.boundary_feedback(out3, bd_coarse)
+
+        out2 = F.gelu(F.interpolate(self.dbn4(self.decoder4(out3)), scale_factor=(2, 2), mode='bilinear', align_corners=True))  # b, c1, H/4, W/4
+        # Wavelet enhancement on t2 before GAB2
+        if self.use_wavelet:
+            t2 = self.wave_enhance2(t2)
+        if self.gt_ds:
             gt_pre2 = self.gt_conv4(out2)
             t2 = self.GAB2(t3, t2, gt_pre2)
-            gt_pre2 = F.interpolate(gt_pre2, scale_factor=4, mode ='bilinear', align_corners=True)
-        else: t2 = self.GAB2(t3, t2)
-        out2 = torch.add(out2, t2) # b, c1, H/4, W/4 
-        
-        out1 = F.gelu(F.interpolate(self.dbn5(self.decoder5(out2)),scale_factor=(2,2),mode ='bilinear',align_corners=True)) # b, c0, H/2, W/2
-        if self.gt_ds: 
+            gt_pre2 = F.interpolate(gt_pre2, scale_factor=4, mode='bilinear', align_corners=True)
+        else:
+            t2 = self.GAB2(t3, t2)
+        out2 = torch.add(out2, t2)  # b, c1, H/4, W/4
+
+        out1 = F.gelu(F.interpolate(self.dbn5(self.decoder5(out2)), scale_factor=(2, 2), mode='bilinear', align_corners=True))  # b, c0, H/2, W/2
+        # Wavelet enhancement on t1 before GAB1
+        if self.use_wavelet:
+            t1 = self.wave_enhance1(t1)
+        if self.gt_ds:
             gt_pre1 = self.gt_conv5(out1)
             t1 = self.GAB1(t2, t1, gt_pre1)
-            gt_pre1 = F.interpolate(gt_pre1, scale_factor=2, mode ='bilinear', align_corners=True)
-        else: t1 = self.GAB1(t2, t1)
-        out1 = torch.add(out1, t1) # b, c0, H/2, W/2
-        
-        out0 = F.interpolate(self.final(out1),scale_factor=(2,2),mode ='bilinear',align_corners=True) # b, num_class, H, W
-        
-        if self.gt_ds:
-            return (torch.sigmoid(gt_pre5), torch.sigmoid(gt_pre4), torch.sigmoid(gt_pre3), torch.sigmoid(gt_pre2), torch.sigmoid(gt_pre1)), torch.sigmoid(out0)
+            gt_pre1 = F.interpolate(gt_pre1, scale_factor=2, mode='bilinear', align_corners=True)
         else:
-            return torch.sigmoid(out0)
+            t1 = self.GAB1(t2, t1)
+        out1 = torch.add(out1, t1)  # b, c0, H/2, W/2
+
+        # Boundary detection at H/2 scale (fine)
+        if self.use_boundary:
+            bd_fine = self.boundary_head_fine(out1)  # (B, 1, H/2, W/2)
+            boundary_out = (bd_coarse, bd_fine)
+
+        out0 = F.interpolate(self.final(out1), scale_factor=(2, 2), mode='bilinear', align_corners=True)  # b, num_class, H, W
+
+        if self.gt_ds:
+            return (torch.sigmoid(gt_pre5), torch.sigmoid(gt_pre4), torch.sigmoid(gt_pre3), torch.sigmoid(gt_pre2), torch.sigmoid(gt_pre1)), torch.sigmoid(out0), boundary_out
+        else:
+            return torch.sigmoid(out0), boundary_out

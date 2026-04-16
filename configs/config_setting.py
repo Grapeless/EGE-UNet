@@ -10,11 +10,14 @@ class setting_config:
 
     network = 'egeunet'
     model_config = {
-        'num_classes': 1, 
-        'input_channels': 3, 
-        'c_list': [8,16,24,32,48,64], 
+        'num_classes': 1,
+        'input_channels': 3,
+        'c_list': [8,16,24,32,48,64],
         'bridge': True,
         'gt_ds': True,
+        'use_ca': True,        # Coordinate Attention on shallow encoders
+        'use_boundary': True,  # Multi-scale Boundary-Aware Supervision
+        'use_wavelet': True,   # Wavelet frequency-domain feature enhancement
     }
 
     datasets = 'isic18' 
@@ -25,7 +28,10 @@ class setting_config:
     else:
         raise Exception('datasets in not right!')
 
-    criterion = GT_BceDiceLoss(wb=1, wd=1)
+    if model_config.get('use_boundary', False):
+        criterion = GT_BceDiceLoss_WithBoundary(wb=1, wd=1, boundary_weight=0.5)
+    else:
+        criterion = GT_BceDiceLoss(wb=1, wd=1)
 
     pretrained_path = './pre_trained/'
     num_classes = 1
@@ -117,7 +123,7 @@ class setting_config:
         dampening = 0 # default: 0 – dampening for momentum
         nesterov = False # default: False – enables Nesterov momentum 
     
-    sch = 'CosineAnnealingLR'
+    sch = 'WP_CosineLR'
     if sch == 'StepLR':
         step_size = epochs // 5 # – Period of learning rate decay.
         gamma = 0.5 # – Multiplicative factor of learning rate decay. Default: 0.1
@@ -130,7 +136,7 @@ class setting_config:
         gamma = 0.99 #  – Multiplicative factor of learning rate decay.
         last_epoch = -1 # – The index of last epoch. Default: -1.
     elif sch == 'CosineAnnealingLR':
-        T_max = 50 # – Maximum number of iterations. Cosine function period.
+        T_max = 300 # – Maximum number of iterations. Cosine function period.
         eta_min = 0.00001 # – Minimum learning rate. Default: 0.
         last_epoch = -1 # – The index of last epoch. Default: -1.  
     elif sch == 'ReduceLROnPlateau':
